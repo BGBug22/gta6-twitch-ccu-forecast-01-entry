@@ -40,8 +40,8 @@ const LOOKUP_SIGMA = 0.01;
 
 // Fallback (M7) tuning: Gaussian kernel bandwidths in log units, and the
 // lowest log-spread the band is allowed to take.
-const BANDWIDTH_VIEWERS = 1.0;
-const BANDWIDTH_CHANNELS = 1.0;
+const BANDWIDTH_VIEWERS = 1.5;
+const BANDWIDTH_CHANNELS = 1.0; // unused in 1D mode
 const SPREAD_FLOOR = 0.1;
 
 // Practice launches, identified four ways each (case id, Twitch category id,
@@ -234,26 +234,32 @@ function fallbackRows(c) {
   const rawComps = Array.isArray(c.raw.comparables) ? c.raw.comparables : [];
   for (const comp of rawComps) {
     const byHour = indexComparable(comp);
-    if (byHour && byHour.has(0)) comps.push(byHour);
+    if (byHour && byHour.has(0)) {
+      const w =
+        typeof comp.platforms === "string" && !comp.platforms.includes("PC") ? 2 : 1;
+      comps.push({ bh: byHour, w });
+    }
   }
   // Deterministic order regardless of the input file's ordering.
   comps.sort((a, b) => {
-    const va = a.get(0).viewers;
-    const vb = b.get(0).viewers;
+    const va = a.bh.get(0).viewers;
+    const vb = b.bh.get(0).viewers;
     return va - vb;
   });
 
   const logP1 = Math.log(c.hour1);
-  const logCh1 = c.channels1 > 0 ? Math.log(c.channels1) : 0;
-  const haveChannels = c.channels1 > 0;
+  const logCh1 = 0; // 1D mode: channels axis dropped (noisy proxy)
+  const haveChannels = false;
   const rows = [];
+  const pooledResid = [];
 
   for (let h = 2; h <= 24; h++) {
     const off = h - 1;
     // Eligible: hour 1 present with viewers (and channels, when the target
     // has them) and this hour present with viewers.
     const pts = [];
-    for (const byHour of comps) {
+    for (const entry of comps) {
+      const byHour = entry.bh;
       const first = byHour.get(0);
       const cur = byHour.get(off);
       if (!first || !cur) continue;
@@ -262,6 +268,7 @@ function fallbackRows(c) {
         x1: Math.log(first.viewers),
         x2: haveChannels ? Math.log(first.channels) : 0,
         y: Math.log(cur.viewers / first.viewers),
+        w: entry.w,
       });
     }
 
@@ -272,7 +279,7 @@ function fallbackRows(c) {
       const ws = pts.map((p) => {
         const d1 = (p.x1 - logP1) / BANDWIDTH_VIEWERS;
         const d2 = haveChannels ? (p.x2 - logCh1) / BANDWIDTH_CHANNELS : 0;
-        return Math.exp(-0.5 * (d1 * d1 + d2 * d2));
+        return Math.exp(-0.5 * (d1 * d1 + d2 * d2)) * p.w;
       });
       // Weighted least squares for y ~ b0 + b1*(x1-t1) + b2*(x2-t2).
       // At the target the offsets are zero, so the prediction is b0.
@@ -302,6 +309,7 @@ function fallbackRows(c) {
           return beta[0] + beta[1] * d1 + beta[2] * d2;
         });
         const residPairs = pts.map((p, i) => [p.y - fitted[i], ws[i]]);
+        for (const rp of residPairs) pooledResid.push(rp);
         const q25 = weightedQuantile(residPairs, 0.25);
         const q75 = weightedQuantile(residPairs, 0.75);
         sigma = Math.max((q75 - q25) / 1.349, SPREAD_FLOOR);
@@ -312,12 +320,13 @@ function fallbackRows(c) {
       // Too few comparables or a failed fit: fall back to a weighted median
       // log-ratio over whatever comparables cover this hour, else persistence.
       const ratios = [];
-      for (const byHour of comps) {
+      for (const entry of comps) {
+        const byHour = entry.bh;
         const first = byHour.get(0);
         const cur = byHour.get(off);
         if (!first || !cur) continue;
         const d1 = (Math.log(first.viewers) - logP1) / BANDWIDTH_VIEWERS;
-        ratios.push([Math.log(cur.viewers / first.viewers), Math.exp(-0.5 * d1 * d1)]);
+        ratios.push([Math.log(cur.viewers / first.viewers), Math.exp(-0.5 * d1 * d1) * entry.w]);
       }
       if (ratios.length > 0) {
         const med = weightedQuantile(ratios, 0.5);
@@ -331,9 +340,15 @@ function fallbackRows(c) {
         median = c.hour1;
       }
     }
-    rows.push(bandFrom(median, sigma));
+    rows.push([median, sigma]);
   }
-  return rows;
+  // One pooled spread for all hours: residuals across every hour share the
+  // same log-scale, so a single IQR-based spread is stabler than per-hour.
+  const pq25 = weightedQuantile(pooledResid, 0.25);
+  const pq75 = weightedQuantile(pooledResid, 0.75);
+  const pooled = Math.max((pq75 - pq25) / 1.349, SPREAD_FLOOR);
+  for (const r of rows) r[1] = pooled;
+  return rows.map(([median, sigma]) => bandFrom(median, sigma));
 }
 
 // ---------------------------------------------------------------------------
